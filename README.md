@@ -1,5 +1,11 @@
 # 服药提醒智能体
 
+**源码公开 · 非商业许可 · 禁止商用**
+
+本项目采用 [PolyForm Noncommercial License 1.0.0](LICENSE)。允许在许可范围内进行非商业使用、学习、修改和再分发；本许可不授予一般商业用途的使用权。再分发时须保留许可证及 [NOTICE](NOTICE) 中的版权声明。许可对非商业组织等允许用途有具体定义，完整条款以 LICENSE 为准。
+
+由于限制商业用途，本项目属于“源码公开”（source-available），不属于 OSI 定义的开源软件。第三方依赖仍遵循各自的许可证，本项目的非商业许可不改变其授权。
+
 手机和电脑都可访问的响应式服药管理网站。React + TypeScript 前端、Express API、SQLite 持久化和 Web Push 提醒，部署时由一个 Node 服务运行。
 
 ## 本地使用
@@ -9,7 +15,8 @@
 开发需要 Node.js **22.13 或更新版本**：
 
 ```powershell
-cd E:\日常聊天\yongyaotixing
+git clone https://github.com/moxing1616/yongyaotixing.git
+cd yongyaotixing
 npm install
 npm run dev
 ```

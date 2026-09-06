@@ -3,6 +3,9 @@ node_modules/
 dist/
 data/
 .env
+.env.*
+!.env.example
+.vercel/
 *.log
 test-results/
 playwright-report/
