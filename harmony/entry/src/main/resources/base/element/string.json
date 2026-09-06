@@ -1,0 +1,7 @@
+{
+  "string": [
+    { "name": "app_name", "value": "服药提醒智能体" },
+    { "name": "module_desc", "value": "药品管理、服药记录与系统提醒" },
+    { "name": "reminder_reason", "value": "按您确认的服药时间及药品有效期发送系统提醒" }
+  ]
+}

@@ -46,6 +46,20 @@ export function localDateTimeToUtc(date, time, timeZone) {
   const [year, month, day] = date.split('-').map(Number);
   const [hour, minute] = time.split(':').map(Number);
   const wanted = Date.UTC(year, month - 1, day, hour, minute, 0);
+  const exactCandidates = new Set();
+  for (const probe of [wanted - 36 * 60 * 60_000, wanted, wanted + 36 * 60 * 60_000]) {
+    const probeParts = zonedParts(new Date(probe), timeZone);
+    const offset = Date.UTC(probeParts.year, probeParts.month - 1, probeParts.day,
+      probeParts.hour, probeParts.minute, probeParts.second) - probe;
+    const candidate = wanted - offset;
+    const candidateParts = zonedParts(new Date(candidate), timeZone);
+    if (candidateParts.year === year && candidateParts.month === month && candidateParts.day === day
+      && candidateParts.hour === hour && candidateParts.minute === minute && candidateParts.second === 0) {
+      exactCandidates.add(candidate);
+    }
+  }
+  if (exactCandidates.size) return new Date(Math.min(...exactCandidates)).toISOString();
+
   let guess = wanted;
   const candidates = new Set([guess]);
   for (let attempt = 0; attempt < 6; attempt += 1) {
@@ -57,7 +71,7 @@ export function localDateTimeToUtc(date, time, timeZone) {
     if (candidates.has(next)) {
       // DST spring gaps oscillate around the missing wall time. Choosing the later
       // candidate moves the reminder forward by the gap (02:30 -> 03:30).
-      return new Date(Math.max(...candidates, next)).toISOString();
+      return new Date(Math.max(guess, next)).toISOString();
     }
     candidates.add(next);
     guess = next;
@@ -345,7 +359,17 @@ export function createApp({
   });
 
   const requireAuth = (req, _res, next) => {
-    const sessionId = cookieMap(req.get('cookie'))[COOKIE_NAME];
+    const authorizationPresent = req.headers.authorization !== undefined;
+    let sessionId;
+    if (authorizationPresent) {
+      const match = /^Bearer ([a-f0-9]{64})$/.exec(req.get('authorization') || '');
+      if (!match) return next(httpError(401, '请先登录。'));
+      const digest = crypto.createHash('sha256').update(match[1]).digest('hex');
+      sessionId = `native:${digest}`;
+    } else {
+      sessionId = cookieMap(req.get('cookie'))[COOKIE_NAME];
+      if (sessionId && !/^[A-Za-z0-9_-]{43}$/.test(sessionId)) return next(httpError(401, '请先登录。'));
+    }
     const row = sessionId ? db.prepare(`
       SELECT s.id AS session_id, u.* FROM sessions s JOIN users u ON u.id = s.user_id
       WHERE s.id = ? AND s.expires_at > ?
@@ -365,6 +389,16 @@ export function createApp({
       httpOnly: true, sameSite: 'strict', secure: env.NODE_ENV === 'production',
       path: '/', maxAge: SESSION_AGE_SECONDS * 1000,
     });
+  };
+
+  const createNativeSession = (userId) => {
+    const accessToken = crypto.randomBytes(32).toString('hex');
+    const id = `native:${crypto.createHash('sha256').update(accessToken).digest('hex')}`;
+    const createdAt = now();
+    const expiresAt = new Date(createdAt.getTime() + SESSION_AGE_SECONDS * 1000);
+    db.prepare('INSERT INTO sessions (id,user_id,expires_at,created_at) VALUES (?,?,?,?)')
+      .run(id, userId, expiresAt.toISOString(), createdAt.toISOString());
+    return { accessToken, expiresAt: expiresAt.toISOString() };
   };
 
   app.get('/api/health', (_req, res) => res.json({ data: { ok: true } }));
@@ -402,6 +436,42 @@ export function createApp({
       authAttempts.delete(attemptKey);
       setSession(res, user.id);
       res.json({ data: userDto(user) });
+    } catch (error) { next(error); }
+  });
+
+  app.post('/api/native/auth/register', async (req, res, next) => {
+    try {
+      const email = normalizeEmail(req.body?.email);
+      consumeAttempt(authAttempts, `register:${req.ip}:${email}`, 10, 60 * 60_000, '注册尝试过于频繁，请稍后再试。');
+      const password = rawPassword(req.body?.password, { registration: true });
+      const name = text(req.body?.name, '昵称', { required: true, max: 80 });
+      const timeZone = text(req.body?.timeZone, '时区', { required: true, max: 100 });
+      if (!validTimeZone(timeZone)) throw httpError(400, '请选择有效的 IANA 时区。');
+      const user = { id: crypto.randomUUID(), email, name, timeZone, createdAt: now().toISOString() };
+      const passwordHash = await hashPassword(password);
+      try {
+        db.prepare('INSERT INTO users (id,email,name,time_zone,password_hash,created_at) VALUES (?,?,?,?,?,?)')
+          .run(user.id, email, name, timeZone, passwordHash, user.createdAt);
+      } catch (error) {
+        if (String(error.message).includes('UNIQUE')) throw httpError(409, '该邮箱已注册。');
+        throw error;
+      }
+      const session = createNativeSession(user.id);
+      res.status(201).json({ data: { user: userDto({ id: user.id, email, name, time_zone: timeZone }), ...session } });
+    } catch (error) { next(error); }
+  });
+
+  app.post('/api/native/auth/login', async (req, res, next) => {
+    try {
+      const email = normalizeEmail(req.body?.email);
+      const attemptKey = `login:${req.ip}:${email}`;
+      consumeAttempt(authAttempts, attemptKey, 8, 15 * 60_000, '登录尝试过于频繁，请稍后再试。');
+      const password = rawPassword(req.body?.password);
+      const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+      if (!user || !(await matchesPassword(password, user.password_hash))) throw httpError(401, '邮箱或密码不正确。');
+      authAttempts.delete(attemptKey);
+      const session = createNativeSession(user.id);
+      res.json({ data: { user: userDto(user), ...session } });
     } catch (error) { next(error); }
   });
 
@@ -484,6 +554,87 @@ export function createApp({
       }
       occurrences.sort((a, b) => a.scheduledAt.localeCompare(b.scheduledAt));
       res.json({ data: occurrences });
+    } catch (error) { next(error); }
+  });
+
+  app.get('/api/native/reminders', requireAuth, (req, res, next) => {
+    try {
+      const generatedAt = now();
+      const horizon = generatedAt.getTime() + 7 * 86_400_000;
+      const timeZone = req.auth.user.time_zone;
+      const firstDate = dateInTimeZone(generatedAt, timeZone);
+      const medications = db.prepare('SELECT * FROM medications WHERE user_id=? AND active=1 ORDER BY created_at,id')
+        .all(req.auth.user.id);
+      const records = db.prepare('SELECT * FROM records WHERE user_id=?').all(req.auth.user.id);
+      const recordsByOccurrence = new Map(records.map((record) => [
+        `${record.medication_id}:${record.date}:${record.time}`, record,
+      ]));
+      const medicationsById = new Map(medications.map((medication) => [medication.id, medication]));
+      const reminders = new Map();
+      const addReminder = (item) => {
+        const timestamp = Date.parse(item.at);
+        if (timestamp > generatedAt.getTime() && timestamp <= horizon && !reminders.has(item.key)) reminders.set(item.key, item);
+      };
+
+      for (let offset = 0; offset <= 8; offset += 1) {
+        const date = addDays(firstDate, offset);
+        for (const medication of medications) {
+          if (medication.start_date <= date && (!medication.end_date || medication.end_date >= date)
+            && (!medication.expiry_date || medication.expiry_date >= date)) {
+            for (const time of JSON.parse(medication.times)) {
+              const record = recordsByOccurrence.get(`${medication.id}:${date}:${time}`);
+              if (record?.status === 'taken' || record?.status === 'skipped' || record?.status === 'snoozed') continue;
+              const at = localDateTimeToUtc(date, time, timeZone);
+              addReminder({
+                key: `dose:${medication.id}:${date}:${time}:${at}`,
+                kind: 'dose', title: '服药提醒', body: `${medication.name} · ${medication.dose}`, at,
+                medicationId: medication.id, date, time,
+              });
+            }
+          }
+          if (medication.expiry_date) {
+            const remaining = daysBetween(date, medication.expiry_date);
+            if (remaining <= 30) {
+              const at = localDateTimeToUtc(date, '09:00', timeZone);
+              const body = remaining < 0
+                ? `${medication.name} 已过期，请核查有效期。`
+                : remaining === 0
+                  ? `${medication.name} 今天到期，请核查有效期。`
+                  : `${medication.name} 将在 ${remaining} 天后到期。`;
+              addReminder({
+                key: `expiry:${medication.id}:${date}`,
+                kind: 'expiry', title: '药品有效期提醒', body, at,
+                medicationId: medication.id, date, time: '09:00',
+              });
+            }
+          }
+        }
+      }
+
+      for (const record of records) {
+        if (record.status !== 'snoozed' || !record.snoozed_until) continue;
+        const medication = medicationsById.get(record.medication_id);
+        if (!medication) continue;
+        if (record.date < medication.start_date || (medication.end_date && record.date > medication.end_date)
+          || !JSON.parse(medication.times).includes(record.time)) continue;
+        const effectiveDate = dateInTimeZone(new Date(record.snoozed_until), timeZone);
+        if (medication.expiry_date && medication.expiry_date < effectiveDate) continue;
+        addReminder({
+          key: `dose:${medication.id}:${record.date}:${record.time}:${record.snoozed_until}`,
+          kind: 'dose', title: '延后服药提醒', body: `${medication.name} · ${medication.dose}`,
+          at: record.snoozed_until, medicationId: medication.id, date: record.date, time: record.time,
+        });
+      }
+
+      const allItems = [...reminders.values()].sort((left, right) =>
+        left.at.localeCompare(right.at) || left.key.localeCompare(right.key));
+      const items = allItems.slice(0, 30);
+      res.json({
+        data: {
+          generatedAt: generatedAt.toISOString(), timeZone, items,
+          total: allItems.length, hasMore: allItems.length > items.length,
+        },
+      });
     } catch (error) { next(error); }
   });
 

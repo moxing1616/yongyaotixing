@@ -10,3 +10,12 @@ data/
 test-results/
 playwright-report/
 *.tsbuildinfo
+harmony/.hvigor/
+harmony/.idea/
+harmony/**/oh_modules/
+harmony/**/build/
+harmony/local.properties
+harmony/signing/
+*.p12
+*.p7b
+*.cer

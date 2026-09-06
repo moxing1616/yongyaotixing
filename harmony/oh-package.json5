@@ -1,0 +1,8 @@
+{
+  "modelVersion": "5.0.0",
+  "name": "medication-reminder-harmony",
+  "version": "1.0.0",
+  "description": "服药提醒智能体鸿蒙客户端",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "dependencies": {}
+}
